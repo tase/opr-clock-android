@@ -7,6 +7,7 @@ import android.util.Log
 import android.view.View
 import android.view.WindowManager
 import androidx.appcompat.app.AppCompatActivity
+import androidx.appcompat.app.AlertDialog
 import java.util.concurrent.Executors
 
 class MainActivity : AppCompatActivity() {
@@ -72,7 +73,7 @@ class MainActivity : AppCompatActivity() {
                     if (rssActive && generation == rssGeneration) {
                         result.onSuccess {
                             headlines = it
-                            clockView.setHeadlines(it)
+                            clockView.setHeadlines(it, fetchedAt = trueTime.nowMillis())
                         }.onFailure { error ->
                             Log.w("RssClient", "Failed to refresh RSS", error)
                             if (headlines.isEmpty()) {
@@ -110,6 +111,22 @@ class MainActivity : AppCompatActivity() {
         setContentView(R.layout.activity_main)
 
         clockView = findViewById(R.id.signage_clock)
+        val preferences = getSharedPreferences("display_settings", MODE_PRIVATE)
+        clockView.setDisplayTheme(DisplayTheme.fromName(preferences.getString("theme", null)))
+        clockView.onThemeRequested = {
+            val themes = DisplayTheme.entries
+            AlertDialog.Builder(this)
+                .setTitle("表示カラーテーマ")
+                .setSingleChoiceItems(themes.map { it.label }.toTypedArray(), themes.indexOf(clockView.displayTheme)) { dialog, index ->
+                    val theme = themes[index]
+                    clockView.setDisplayTheme(theme)
+                    preferences.edit().putString("theme", theme.name).apply()
+                    dialog.dismiss()
+                }
+                .setNegativeButton("閉じる", null)
+                .setOnDismissListener { hideSystemUi() }
+                .show()
+        }
         hideSystemUi()
         clockView.setHeadline(getString(R.string.rss_loading))
 

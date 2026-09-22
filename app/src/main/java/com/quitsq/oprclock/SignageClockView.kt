@@ -5,12 +5,16 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.RectF
+import android.graphics.LinearGradient
+import android.graphics.Shader
 import java.text.SimpleDateFormat
 import android.util.AttributeSet
 import android.text.TextPaint
 import android.text.StaticLayout
 import android.text.Layout
 import android.os.SystemClock
+import android.view.MotionEvent
+import android.view.ViewConfiguration
 import android.view.View
 import androidx.core.content.res.ResourcesCompat
 import kotlin.math.min
@@ -78,14 +82,27 @@ class SignageClockView @JvmOverloads constructor(
     private var previousFrame = 0L
     private var scrolling = false
     private val newsTop = 180f
-    private val newsHeight = 348f
+    private val newsHeight = 310f
+    private var newsUpdatedLabel = "ニュース最終取得：未取得"
+    private val newsUpdatedFormat = SimpleDateFormat("yyyy/MM/dd HH:mm", Locale.JAPAN).apply {
+        timeZone = TimeZone.getTimeZone("Asia/Tokyo")
+    }
+    private val newsUpdatedPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.LTGRAY
+        textSize = 18f
+        typeface = headlinePaint.typeface
+    }
 
     fun setHeadline(text: String) = setHeadlines(listOf(text))
 
-    fun setHeadlines(items: List<String>) {
+    fun setHeadlines(items: List<String>, fetchedAt: Long? = null) {
+        if (fetchedAt != null) {
+            newsUpdatedLabel = "ニュース最終取得：${newsUpdatedFormat.format(Date(fetchedAt))} JST"
+            invalidate()
+        }
         if (headlines == items) return
         headlines = items.toList()
-        contentDescription = items.joinToString("。")
+        contentDescription = items.joinToString("。") + "。長押しで表示テーマを変更"
         val text = items.joinToString("\n") { "・$it" }
         newsLayout = StaticLayout.Builder.obtain(
             text, 0, text.length,
@@ -109,6 +126,7 @@ class SignageClockView @JvmOverloads constructor(
 
     fun setTime(jst: Calendar) {
         jstCal = jst
+        refreshAppearance()
         invalidate()
     }
 
@@ -119,6 +137,12 @@ class SignageClockView @JvmOverloads constructor(
         val sy = height / designHeight
         val scale = min(sx, sy)
 
+        if (appearance != null) {
+            val save = canvas.save()
+            canvas.scale(width / designWidth, height / designHeight)
+            canvas.drawRect(0f, 0f, designWidth, designHeight, bgPaint)
+            canvas.restoreToCount(save)
+        } else canvas.drawColor(activePalette.background)
         canvas.save()
         canvas.scale(scale, scale)
 
@@ -131,6 +155,59 @@ class SignageClockView @JvmOverloads constructor(
         drawRadar(canvas)
         drawForecast(canvas)
         canvas.restore()
+    }
+
+    private var showForecastGraph = true
+    private var trackingForecastSwipe = false
+    private var swipeStartX = 0f
+    private var swipeStartY = 0f
+    private val swipeThreshold = maxOf(
+        ViewConfiguration.get(context).scaledTouchSlop * 2f,
+        32f * resources.displayMetrics.density
+    )
+
+    override fun onTouchEvent(event: MotionEvent): Boolean {
+        val handled = super.onTouchEvent(event)
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                val scale = min(width / designWidth, height / designHeight)
+                if (scale <= 0f || event.x / scale !in 1360f..1896f ||
+                    event.y / scale !in 175f..530f) return handled
+                swipeStartX = event.x
+                swipeStartY = event.y
+                trackingForecastSwipe = true
+                return true
+            }
+            MotionEvent.ACTION_MOVE -> {
+                if (!trackingForecastSwipe) return handled
+                val dx = kotlin.math.abs(event.x - swipeStartX)
+                val dy = kotlin.math.abs(event.y - swipeStartY)
+                if (dy > swipeThreshold && dy > dx) trackingForecastSwipe = false
+                return true
+            }
+            MotionEvent.ACTION_UP -> {
+                if (!trackingForecastSwipe) return handled
+                trackingForecastSwipe = false
+                val dx = kotlin.math.abs(event.x - swipeStartX)
+                val dy = kotlin.math.abs(event.y - swipeStartY)
+                if (dx >= swipeThreshold && dx > dy * 1.5f) {
+                    showForecastGraph = !showForecastGraph
+                    invalidate()
+                }
+                return true
+            }
+            MotionEvent.ACTION_CANCEL, MotionEvent.ACTION_POINTER_DOWN -> {
+                val wasTracking = trackingForecastSwipe
+                trackingForecastSwipe = false
+                return wasTracking
+            }
+        }
+        return trackingForecastSwipe || handled
+    }
+
+    override fun performClick(): Boolean {
+        super.performClick()
+        return true
     }
 
     private var radar: RadarFrame? = null
@@ -188,8 +265,67 @@ class SignageClockView @JvmOverloads constructor(
         timeZone = TimeZone.getTimeZone("Asia/Tokyo")
     }
 
+    private val forecastEndTime = SimpleDateFormat("HH時", Locale.JAPAN).apply {
+        timeZone = TimeZone.getTimeZone("Asia/Tokyo")
+    }
+
+    private val temperatureGraphPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.rgb(255, 193, 92)
+        strokeWidth = 3f
+        strokeCap = Paint.Cap.ROUND
+    }
+    private val rainGraphPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.rgb(91, 180, 255)
+    }
+    private val graphGridPaint = Paint().apply {
+        color = Color.rgb(65, 65, 65)
+        strokeWidth = 1f
+    }
+
+    var displayTheme: DisplayTheme = DisplayTheme.STANDARD
+        private set
+    private var activePalette = DisplayTheme.STANDARD
+    private var appearance: WeatherAppearance? = null
+    var onThemeRequested: (() -> Unit)? = null
+
+    init {
+        setOnLongClickListener {
+            trackingForecastSwipe = false
+            onThemeRequested?.invoke()
+            true
+        }
+        setDisplayTheme(DisplayTheme.STANDARD)
+    }
+
+    fun setDisplayTheme(theme: DisplayTheme) {
+        displayTheme = theme
+        refreshAppearance()
+    }
+
+    private fun refreshAppearance() {
+        val next = if (displayTheme == DisplayTheme.AUTO)
+            WeatherAppearance.resolve(jstCal.timeInMillis, forecast) else null
+        val theme = next?.palette ?: displayTheme
+        if (appearance == next && activePalette == theme) return
+        appearance = next
+        activePalette = theme
+        bgPaint.shader = next?.let {
+            LinearGradient(0f, 0f, 0f, designHeight, it.top, it.bottom, Shader.TileMode.CLAMP)
+        }
+        bgPaint.color = theme.background
+        listOf(dividerPaint, segOnPaint, textPaint, weekdayMainPaint, weekdayRestPaint,
+            headlinePaint, radarTextPaint, forecastPaint).forEach { it.color = theme.foreground }
+        segOffPaint.color = theme.inactiveSegment
+        newsUpdatedPaint.color = theme.secondary
+        temperatureGraphPaint.color = theme.temperature
+        rainGraphPaint.color = theme.rain
+        graphGridPaint.color = theme.grid
+        invalidate()
+    }
+
     fun setForecast(value: Forecast) {
         forecast = value
+        refreshAppearance()
         forecastFailed = false
         invalidate()
     }
@@ -203,31 +339,115 @@ class SignageClockView @JvmOverloads constructor(
         forecastPaint.textSize = 22f
         canvas.drawText("名古屋 24時間天気予報（JST）", 1360f, 197f, forecastPaint)
         forecastPaint.textSize = 17f
+        forecastPaint.textAlign = Paint.Align.RIGHT
+        canvas.drawText(if (showForecastGraph) "詳細 ↔［グラフ］" else "［詳細］↔ グラフ",
+            1896f, 197f, forecastPaint)
+        forecastPaint.textAlign = Paint.Align.LEFT
         val data = forecast
         if (data == null) {
             canvas.drawText(if (forecastFailed) "取得失敗・自動再試行します" else "天気予報を取得しています…", 1360f, 335f, forecastPaint)
         } else {
-            for (column in 0..1) {
-                val x = 1360f + column * 276f
-                canvas.drawText("時刻", x, 226f, forecastPaint)
-                canvas.drawText("天気", x + 84f, 226f, forecastPaint)
-                canvas.drawText("気温℃", x + 143f, 226f, forecastPaint)
-                canvas.drawText("降水%", x + 206f, 226f, forecastPaint)
-                data.hours.drop(column * 12).take(12).forEachIndexed { index, hour ->
-                    val y = 249f + index * 22f
-                    canvas.drawText(forecastTime.format(Date(hour.time)), x, y, forecastPaint)
-                    canvas.drawText(ForecastClient.description(hour.weatherCode), x + 84f, y, forecastPaint)
-                    canvas.drawText(hour.temperature?.let { String.format(Locale.JAPAN, "%.0f°", it) } ?: "—", x + 143f, y, forecastPaint)
-                    canvas.drawText(hour.rainProbability?.let { "$it%" } ?: "—", x + 206f, y, forecastPaint)
-                }
-            }
+            if (showForecastGraph) drawForecastGraph(canvas, data) else drawForecastDetails(canvas, data)
         }
         val stale = data != null && (System.currentTimeMillis() - data.fetchedAt > 60 * 60_000L || data.hours.first().time < System.currentTimeMillis())
         val status = if (forecastFailed || stale) "更新待ち" else data?.let { "取得 " + radarTimeFormat.format(Date(it.fetchedAt)) } ?: ""
+        forecastPaint.textSize = 17f
         canvas.drawText("Open-Meteo (CC BY 4.0)  $status", 1360f, 520f, forecastPaint)
     }
 
+    private fun drawForecastDetails(canvas: Canvas, data: Forecast) {
+        forecastPaint.textSize = 17f
+        for (column in 0..1) {
+            val x = 1360f + column * 276f
+            canvas.drawText("時刻", x, 230f, forecastPaint)
+            canvas.drawText("天気", x + 90f, 230f, forecastPaint)
+            canvas.drawText("気温", x + 150f, 230f, forecastPaint)
+            canvas.drawText("降水%", x + 212f, 230f, forecastPaint)
+            data.hours.drop(column * 12).take(12).forEachIndexed { index, hour ->
+                val y = 254f + index * 22f
+                canvas.drawText(forecastTime.format(Date(hour.time)), x, y, forecastPaint)
+                canvas.drawText(ForecastClient.description(hour.weatherCode), x + 90f, y, forecastPaint)
+                val temperature = hour.temperature?.takeIf { it.isFinite() }
+                    ?.let { String.format(Locale.JAPAN, "%.0f°", it) } ?: "—"
+                canvas.drawText(temperature, x + 150f, y, forecastPaint)
+                canvas.drawText(hour.rainProbability?.let { "$it%" } ?: "—", x + 212f, y, forecastPaint)
+            }
+        }
+    }
+
+    private fun drawForecastGraph(canvas: Canvas, data: Forecast) {
+        val hours = data.hours
+        if (hours.isEmpty()) return
+        val left = 1410f
+        val right = 1880f
+        val step = (right - left) / hours.size
+        fun x(index: Int) = left + (index + 0.5f) * step
+
+        forecastPaint.textSize = 17f
+        canvas.drawText(
+            forecastTime.format(Date(hours.first().time)) + " 〜 " +
+                forecastTime.format(Date(hours.last().time)), 1360f, 227f, forecastPaint)
+        forecastPaint.color = temperatureGraphPaint.color
+        canvas.drawText("気温 ℃", 1360f, 253f, forecastPaint)
+        val temperatures = hours.mapNotNull { it.temperature?.takeIf { value -> value.isFinite() } }
+        val low = kotlin.math.floor((temperatures.minOrNull() ?: 0.0) / 5) * 5
+        val high = maxOf(low + 5, kotlin.math.ceil((temperatures.maxOrNull() ?: 5.0) / 5) * 5)
+        fun temperatureY(value: Double) = 342f - ((value - low) / (high - low) * 74f).toFloat()
+        forecastPaint.textAlign = Paint.Align.RIGHT
+        for (value in listOf(low, high)) {
+            val y = temperatureY(value)
+            canvas.drawLine(left, y, right, y, graphGridPaint)
+            canvas.drawText(String.format(Locale.JAPAN, "%.0f°", value), left - 8f, y + 5f, forecastPaint)
+        }
+        hours.forEachIndexed { index, hour ->
+            val temperature = hour.temperature?.takeIf { it.isFinite() } ?: return@forEachIndexed
+            val y = temperatureY(temperature)
+            val previous = hours.getOrNull(index - 1)?.temperature?.takeIf { it.isFinite() }
+            if (previous != null) {
+                canvas.drawLine(x(index - 1), temperatureY(previous), x(index), y, temperatureGraphPaint)
+            }
+            canvas.drawCircle(x(index), y, 2.5f, temperatureGraphPaint)
+        }
+        forecastPaint.textAlign = Paint.Align.LEFT
+        if (temperatures.isEmpty()) canvas.drawText("データなし", left, 310f, forecastPaint)
+
+        forecastPaint.color = rainGraphPaint.color
+        canvas.drawText("降水確率 %", 1360f, 370f, forecastPaint)
+        forecastPaint.textAlign = Paint.Align.RIGHT
+        for (probability in listOf(0, 100)) {
+            val y = 436f - probability * 0.5f
+            canvas.drawLine(left, y, right, y, graphGridPaint)
+            canvas.drawText("$probability", left - 8f, y + 5f, forecastPaint)
+        }
+        forecastPaint.textAlign = Paint.Align.CENTER
+        hours.forEachIndexed { index, hour ->
+            val probability = hour.rainProbability
+            if (probability == null) {
+                canvas.drawText("—", x(index), 425f, forecastPaint)
+            } else {
+                val top = 436f - probability.coerceIn(0, 100) * 0.5f
+                canvas.drawRect(x(index) - step * 0.35f, top, x(index) + step * 0.35f, 436f, rainGraphPaint)
+            }
+        }
+        forecastPaint.color = activePalette.foreground
+        hours.chunked(3).forEachIndexed { index, group ->
+            val center = x(index * 3 + (group.size - 1) / 2)
+            canvas.drawText(forecastEndTime.format(Date(group[(group.size - 1) / 2].time)), center, 461f, forecastPaint)
+            val weather = group.groupingBy { ForecastClient.description(it.weatherCode) }
+                .eachCount().maxByOrNull { it.value }?.key ?: "不明"
+            canvas.drawText(weather, center, 486f, forecastPaint)
+        }
+        forecastPaint.textAlign = Paint.Align.LEFT
+    }
+
     private fun drawNews(canvas: Canvas) {
+        canvas.drawText(newsUpdatedLabel, 24f, 520f, newsUpdatedPaint)
+        newsUpdatedPaint.textAlign = Paint.Align.RIGHT
+        newsUpdatedPaint.textSize = if (appearance != null) 12f else 18f
+        canvas.drawText(appearance?.let { "自動：${it.label} ／ 長押しで変更" }
+            ?: "長押しでテーマ変更", 760f, 520f, newsUpdatedPaint)
+        newsUpdatedPaint.textSize = 18f
+        newsUpdatedPaint.textAlign = Paint.Align.LEFT
         val layout = newsLayout ?: return
         val overflow = layout.height > newsHeight
         val now = SystemClock.uptimeMillis()
